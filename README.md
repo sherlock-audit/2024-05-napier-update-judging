@@ -65,6 +65,81 @@ Consider removing this check altogether, or you can implement it exactly as `Eth
 +if (_requestId > ETHERFI_WITHDRAW_NFT.lastFinalizedRequestId()) revert RequestInQueue();
 ```
 
+
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/napierfi/napier-v1/pull/222
+
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
+# Issue H-2: Users can frontrun LSTs/LRTs tokens prices decrease in order to avoid losses 
+
+Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/65 
+
+The protocol has acknowledged this issue.
+
+## Found by 
+zzykxx
+## Summary
+
+Users can redeem their `PT`/`YT` tokens before a price decrease of a supported LST/LRT token in order to avoid losses.
+
+## Vulnerability Detail
+
+Napier allows users to redeem their `PT`/`YT` tokens for `ETH` via [BaseLSTAdapter::prefundedRedeem()](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/adapters/BaseLSTAdapter.sol#L168) instantly if the amount to be withdrawn is lower or equal than the available `ETH` buffer. The in-scope adapters that allow this are:
+
+- [EETHAdapter](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/adapters/etherfi/EETHAdapter.sol)
+- [UniEthAdapter](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/adapters/bedrock/UniETHAdapter.sol)
+
+A Napier user that staked in one of these adapters can:
+
+1. Monitor the mempool and the beacon chain to know in advance if either the `eETH` or `uniETH` tokens will lose value.
+2. Frontrun the value loss by redeeming their `PT` and `YT`tokens via [Tranche::redeemWithYT()](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/Tranche.sol#L231), which will call [BaseLSTAdapter::prefundedRedeem()](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/adapters/BaseLSTAdapter.sol#L168), in exchange for `ETH`.
+
+Because the value drop is still not reflected in the Napier protocol the staker will be able to withdraw his funds without being affected by the losses.
+
+In the case of `eETH`, a rebase token, an attacker can know if a balance drop will happen by monitoring the mempool for calls to `rebase()` in the EtherFi [LiquidityPool](https://etherscan.io/address/0x308861A430be4cce5502d0A12724771Fc6DaF216#writeProxyContract) contract.
+
+In the case of `uniEth` an attacker can know if the token will lose value by monitoring the protocol validators for penalties and slashing events. Bedrock (`uniEth`) is built on top of Eigenlayer, which can be notified of balance drops due to penalties or slashings via two permissionless functions: [EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185) and [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232). This allows an attacker to perform the following series of calls atomically to avoid losses:
+
+1. Monitor the Bedrock validators on the beacon chain for penalties and slashings.
+2. Call [Tranche::redeemWithYT()](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/Tranche.sol#L231) to redeem `PT`/`YT` in exchange of `ETH`.
+3. Call [EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185)/[EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) to notify Eigenlayer of the balance drop.
+4. The value of `uniETH` will instantly drop.
+5. Deposit the previously withdrawn `ETH` for more `YT`/`PT` tokens than the initial amount.
+
+Another instance that instantly lowers the value held by the `UniEthAdapter` adapter is the call to [UniETHAdapter::swapUniETHForETH()](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/adapters/bedrock/UniETHAdapter.sol#L185) because a `0.05%` fee is paid to UniswapV3, this can also be front run by stakers to avoid bearing the losses of the fee.
+
+## Impact
+
+Stakers can avoid losses, which implies honest stakers will lose more than they should.
+
+## Code Snippet
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+Introduce a withdraw queue, this will prevent this kind of frontrunning attacks.
+
+
+
+
+## Discussion
+
+**massun-onibakuchi**
+
+It is known behavior seen in many LST/LRT integrations like DEX 
+
 # Issue M-1: `currentStakeLimit` depletes faster in some adapters, due to actual amount spent less than the input `stakeAmount` 
 
 Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/8 
@@ -121,192 +196,15 @@ The `_stake()` method do returns the actual spent amount, therefore I suggest to
 **sherlock-admin2**
 
 The protocol team fixed this issue in the following PRs/commits:
- https://github.com/napierfi/napier-uups-adapters/pull/9
 https://github.com/napierfi/napier-v1/pull/219
+ https://github.com/napierfi/napier-uups-adapters/pull/9
 
 
-# Issue M-2: `uniETH` will get stuck within `uniETHSwapper` if swap crosses set `sqrtPriceLimitX96` 
+**sherlock-admin2**
 
-Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/10 
+The Lead Senior Watson signed off on the fix.
 
-## Found by 
-yamato
-## Summary
-Funds will get stuck within the `uniETHSwapper` contract. 
-
-## Vulnerability Detail
-When swapping `uniETH` for eth, the `rebalancer` inputs a `data` in which the `sqrtPriceLimitX96` is encoded.
-```solidity
-    function swapUniETHForETH(
-        uint256 amount,
-        uint256 deadline,
-        uint256 minEthOut,
-        bytes calldata data
-    ) external nonReentrant onlyRebalancer {
-        if (amount >= 32 ether) revert SwapAmountTooLarge();
-
-        /// INTERACT ///
-        uint256 balanceBefore = IWETH9(Constants.WETH).balanceOf(address(this));
-        SafeERC20.forceApprove(IERC20(Constants.UNIETH), address(swapper), amount + 1); // avoild storage value goes to 0
-        swapper.swap(amount, deadline, minEthOut, data);
-        uint256 received = IWETH9(Constants.WETH).balanceOf(address(this)) - balanceBefore;
-
-        /// WRITE ///
-        bufferEth += SafeCast.toUint128(received);
-    }
-```
-```solidity
-    function swap(uint256 amountIn, uint256 deadline, uint256 minEthOut, bytes calldata data) external {
-        SafeERC20.safeTransferFrom(IERC20(Constants.UNIETH), msg.sender, address(this), amountIn);
-        // Uniswap V3 uniETH/ETH 0.05 % fee tier pool: https://app.uniswap.org/explore/tokens/ethereum/0xf1376bcef0f78459c0ed0ba5ddce976f1ddf51f4
-        router.exactInputSingle(
-            ISwapRouter.ExactInputSingleParams({
-                tokenIn: Constants.UNIETH,
-                tokenOut: Constants.WETH,
-                fee: 500, // 0.05%
-                recipient: msg.sender,
-                deadline: deadline,
-                amountIn: amountIn,
-                amountOutMinimum: minEthOut,
-                sqrtPriceLimitX96: abi.decode(data, (uint160))  // @audit - here
-            })
-        );
-    }
-```
-
-The problem is that if the swap crosses that price, it stops. If 1 ETH is to be swapped, and only half of it can be swapped within the price limit, the router will only take that 0.5 eth and the rest will remain within the `uniETHSwapper` contract stuck 
-
-Code snippet from the univ3 pool:
-```solidity
-        // continue swapping as long as we haven't used the entire input/output and haven't reached the price limit
-        while (state.amountSpecifiedRemaining != 0 && state.sqrtPriceX96 != sqrtPriceLimitX96) {
-```
-
-## Impact
-Lost/ Stuck funds
-
-## Code Snippet
-https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/adapters/bedrock/UniETHSwapper.sol#L39
-https://github.com/Uniswap/v3-core/blob/main/contracts/UniswapV3Pool.sol#L640
-## Tool used
-
-Manual Review
-
-## Recommendation
-refund any excess uniETH upon swap
-
-
-
-## Discussion
-
-**massun-onibakuchi**
-
-Could you show us PoC?
-
-**z3s**
-
-request poc
-
-**sherlock-admin4**
-
-PoC requested from @yamato1x
-
-Requests remaining: **4**
-
-**yamato1x**
-
-Hey, here's a POC. Couldn't run the provided test suite, so I wrote my own file. Run it on mainnet fork to see the results.
-```solidity
-// SPDX-License-Identifier: GPL-3.0-or-later
-pragma solidity ^0.8.19;
-import {Test, console} from "forge-std/Test.sol";
-
-// interfaces
-import {IWETH9} from "../IWETH9.sol";
-import {ISwapRouter} from "../ISwapRouter.sol";
-
-// libs
-import {IERC20, SafeERC20} from "../SafeERC20.sol";
-import "../Constants.sol" as Constants;
-import {UniswapV3Pool} from "../IUniswapV3Pool.sol"; 
-
-/// @title UniETHSwapper - A periphery contract for uniETH/WETH swaps
-contract UniETHSwapper {
-    ISwapRouter immutable router;
-
-    constructor(address _router) {
-        router = ISwapRouter(_router);
-        SafeERC20.forceApprove(IERC20(Constants.UNIETH), _router, type(uint256).max);
-    }
-
-    /// @notice swap uniETH for WETH
-    /// @dev Caller must approve this contract to spend WETH
-    /// @dev Swapper must send back remaining WETH to the caller after the swap
-    /// @param amountIn The amount of uniETH to swap
-    /// @param deadline The deadline for the swap
-    /// @param minEthOut The minimum amount of WETH to receive
-    function swap(uint256 amountIn, uint256 deadline, uint256 minEthOut, bytes calldata data) external {
-        SafeERC20.safeTransferFrom(IERC20(Constants.UNIETH), msg.sender, address(this), amountIn);
-        // Uniswap V3 uniETH/ETH 0.05 % fee tier pool: https://app.uniswap.org/explore/tokens/ethereum/0xf1376bcef0f78459c0ed0ba5ddce976f1ddf51f4
-        router.exactInputSingle(
-            ISwapRouter.ExactInputSingleParams({
-                tokenIn: Constants.UNIETH,
-                tokenOut: Constants.WETH,
-                fee: 500, // 0.05%
-                recipient: msg.sender,
-                deadline: deadline,
-                amountIn: amountIn,
-                amountOutMinimum: minEthOut,
-                sqrtPriceLimitX96: abi.decode(data, (uint160))
-            })
-        );
-    }
-}
-
-
-contract MyTest is Test { 
-    UniETHSwapper swapper = new UniETHSwapper(0xE592427A0AEce92De3Edee1F18E0157C05861564);
-    IWETH9 weth = IWETH9(Constants.WETH);
-    IERC20 uniETH = IERC20(Constants.UNIETH);
-
-    address user = address(1);
-    UniswapV3Pool pool = UniswapV3Pool(0x466882EE013A5c9Fb0e4e08ca0804F71aC58c6Cc);
-
-    function setUp() public { 
-        deal(address(uniETH), user, 100 ether);
-    }
-
-    function test_stuckETH() public { 
-        (uint256 sqrtPriceLimit,,,,,,) = pool.slot0();
-        vm.startPrank(user);
-        uniETH.approve(address(swapper), 100 ether);
-        swapper.swap(100 ether, block.timestamp + 1, 0, abi.encode(sqrtPriceLimit + 10000));
-        
-        uint256 endBalance = uniETH.balanceOf(address(swapper));
-        assertEq(endBalance > 0, true);
-        console.log("endBalance: ", endBalance);
-    }   
-}
-```
-
-Example results: 
-```solidity
-[PASS] test_stuckETH() (gas: 140845)
-Logs:
-  endBalance:  99999999999999999998
-```
-
-Also, since loss of funds is significant, I believe this is high severity 
-
-**massun-onibakuchi**
-
-Got it
-> Also, since loss of funds is significant, I believe this is high severity
-
-though I think it depends on cases because the PoC set `minEthOut` to zero and so limited `sqrtPriceLimitX96`.
-Also, uniETHAdapter can't swap more than 32 eth
-
-# Issue M-3: Depositing `stETH` to puffer finance will revert due to wrong implementation of `PufETHAdapter._stake` call 
+# Issue M-2: Depositing `stETH` to puffer finance will revert due to wrong implementation of `PufETHAdapter._stake` call 
 
 Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/21 
 
@@ -408,7 +306,15 @@ The protocol team fixed this issue in the following PRs/commits:
 https://github.com/napierfi/napier-uups-adapters/pull/10
 
 
-# Issue M-4: Missing stake limit validation on `RenzoAdapter._stake` 
+**zzykxx**
+
+This has been fixed by changing the functionality of the `_stake()` function, now it deposits `WETH` instead of `stETH`.
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
+# Issue M-3: Missing stake limit validation on `RenzoAdapter._stake` 
 
 Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/24 
 
@@ -551,12 +457,22 @@ The protocol team fixed this issue in the following PRs/commits:
 https://github.com/napierfi/napier-uups-adapters/pull/11
 
 
-# Issue M-5: Less rsETH minted than intended in volatile conditions. due to zero slippage when staking ETH to mint rsETH 
+**zzykxx**
+
+An edge case in the proposed fix was found: `_stake()` reverts if `totalTVL` is greater than `maxDepositTVL`. It has been fixed in new PR: https://github.com/napierfi/napier-uups-adapters/pull/22
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
+# Issue M-4: Less rsETH minted than intended in volatile conditions. due to zero slippage when staking ETH to mint rsETH 
 
 Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/26 
 
+The protocol has acknowledged this issue.
+
 ## Found by 
-BiasedMerc, Ironsidesec
+Bauchibred, BiasedMerc, Ironsidesec, merlin, zzykxx
 ## Summary
 This issue is not at all related to external admin, but the slippage parameter being zero is the issue. Read the issue flow after below images
 
@@ -716,7 +632,14 @@ It makes sense but depegging upward is economically unlikely. some protocols see
 
 https://github.com/pendle-finance/pendle-core-v2-public/blob/77b3630c82412b580bce6cd4a32f2c385bbb7970/contracts/core/StandardizedYield/implementations/KelpDAO/PendleRsETHSY.sol#L79
 
-# Issue M-6: Slippage on `MetapoolRouter.addLiquidityOneETHKeepYt` 
+[`TrancheRouter`](https://github.com/sherlock-audit/2024-05-napier-update/blob/c31af59c6399182fd04b40530d79d98632d2bfa7/metapool-router/lib/v1-pool/src/TrancheRouter.sol#L39) (TrancheRouter calls Tranche) checks how many PT a user should receive
+
+amount of PT issued indirectly depends on rsETH price. so, I think TrancheRouter prevents such unexpected slippage.
+https://github.com/sherlock-audit/2024-05-napier-update/blob/c31af59c6399182fd04b40530d79d98632d2bfa7/napier-uups-adapters/src/adapters/kelp/RsETHAdapter.sol#L107-L109
+https://github.com/sherlock-audit/2024-05-napier-update/blob/c31af59c6399182fd04b40530d79d98632d2bfa7/napier-uups-adapters/src/adapters/BaseLSTAdapterUpgradeable.sol#L87
+
+
+# Issue M-5: Slippage on `MetapoolRouter.addLiquidityOneETHKeepYt` 
 
 Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/28 
 
@@ -817,7 +740,21 @@ https://github.com/sherlock-audit/2024-05-napier-update/blob/c31af59c6399182fd04
     }
 ```
 
-# Issue M-7: Incorrect checking in `receiveFlashLoan` can cause `swapETHForYt` to fail unexpectedly. 
+
+
+## Discussion
+
+**sherlock-admin2**
+
+The protocol team fixed this issue in the following PRs/commits:
+https://github.com/napierfi/metapool-router/pull/30
+
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
+
+# Issue M-6: Incorrect checking in `receiveFlashLoan` can cause `swapETHForYt` to fail unexpectedly. 
 
 Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/36 
 
@@ -889,76 +826,202 @@ The protocol team fixed this issue in the following PRs/commits:
 https://github.com/napierfi/metapool-router/pull/28
 
 
-# Issue M-8: PufETHAdapter does not handle the case when the stakeLimit of stETH is zero correctly 
+**sherlock-admin2**
 
-Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/48 
+The Lead Senior Watson signed off on the fix.
+
+# Issue M-7: Checking `RSETH_DEPOSIT_POOL.minAmountToDeposit()` in `RsETHAdapter::_stake()` causes Dos 
+
+Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/46 
 
 ## Found by 
-merlin
-## Summary
-`PufETHAdapter` does not handle the case when the `stakeLimit of stETH` is zero correctly.
-```solidity
-/// @dev Need to check the current staking limit before staking to prevent DoS.
-    function _stake(uint256 stakeAmount) internal override returns (uint256) {
-```
+Drynooo, PNS, merlin, no, zzykxx
 
+## Summary
+Checking `RSETH_DEPOSIT_POOL.minAmountToDeposit()` in `RsETHAdapter::_stake()` causes Dos
 ## Vulnerability Detail
-If `STETH.getCurrentStakeLimit()` returns a zero value, then `stakeAmount` will also be 0, which will lead to a call to the `STETH.submit` function with zero `msg.value`, and the transaction will revert with `ZERO_DEPOSIT` reason.
-```solidity
-function _stake(uint256 stakeAmount) internal override returns (uint256) {
+```javascript
+ function _stake(uint256 stakeAmount) internal override returns (uint256) {
         if (stakeAmount == 0) return 0;
 
-        uint256 stakeLimit = STETH.getCurrentStakeLimit();
-        if (stakeAmount > stakeLimit) { // 1 WETH > 0
+        // Check LRTDepositPool stake limit
+        uint256 stakeLimit = RSETH_DEPOSIT_POOL.getAssetCurrentLimit(Constants.ETH);
+        if (stakeAmount > stakeLimit) {
             // Cap stake amount
-            stakeAmount = stakeLimit; // stakeAmount = 0
+            stakeAmount = stakeLimit;
+        }
+        // Check LRTDepositPool minAmountToDeposit
+@>        if (stakeAmount <= RSETH_DEPOSIT_POOL.minAmountToDeposit()) revert MinAmountToDepositError();
+        // Check paused of LRTDepositPool
+        if (RSETH_DEPOSIT_POOL.paused()) revert ProtocolPaused();
+
+        // Interact
+        IWETH9(Constants.WETH).withdraw(stakeAmount);
+        uint256 _rsETHAmt = RSETH.balanceOf(address(this));
+        RSETH_DEPOSIT_POOL.depositETH{value: stakeAmount}(0, REFERRAL_ID);
+        _rsETHAmt = RSETH.balanceOf(address(this)) - _rsETHAmt;
+
+        if (_rsETHAmt == 0) revert InvariantViolation();
+
+        return stakeAmount;
+    }
+```
+The _stake will revert in the condition that the stakeAmount is less than `RSETH_DEPOSIT_POOL.minAmountToDeposit()`, which is 100000000000000. This could always happens. Because stakeAmount is not the user's input, it is calculate by this protocal.
+```javascript
+function prefundedDeposit() external nonReentrant onlyTranche returns (uint256, uint256) {
+        LSTAdapterStorage storage $ = _getStorage();
+
+        uint256 bufferEthCache = $.bufferEth; // cache storage reads
+        uint256 queueEthCache = $.totalQueueEth; // cache storage reads
+        uint256 assets = IWETH9(WETH).balanceOf(address(this)) - bufferEthCache; // amount of WETH deposited at this time
+        uint256 shares = previewDeposit(assets);
+
+        if (assets == 0) return (0, 0);
+        if (shares == 0) revert ZeroShares();
+
+        // Calculate the target buffer amount considering the user's deposit.
+        // bufferRatio is defined as the ratio of ETH balance to the total assets in the adapter in ETH.
+        // Formula:
+        // desiredBufferRatio = (totalQueueEth + bufferEth + assets - s) / (totalQueueEth + bufferEth + stakedEth + assets)
+        // Where:
+        // assets := Amount of ETH the user is depositing
+        // s := Amount of ETH to stake at this time, s <= bufferEth + assets.
+        //
+        // Thus, the formula can be simplified to:
+        // s = (totalQueueEth + bufferEth + assets) - (totalQueueEth + bufferEth + stakedEth + assets) * desiredBufferRatio
+        //   = (totalQueueEth + bufferEth + assets) - targetBufferEth
+        //
+        // Flow:
+        // If `s` <= 0, don't stake any ETH.
+        // If `s` < bufferEth + assets, stake `s` amount of ETH.
+        // If `s` >= bufferEth + assets, all available ETH can be staked in theory.
+        // However, we cap the stake amount. This is to prevent the buffer from being completely drained.
+        //
+        // Let `a` be the available amount of ETH in the buffer after the deposit. `a` is calculated as:
+        // a = (bufferEth + assets) - s
+        uint256 targetBufferEth = ((totalAssets() + assets) * $.targetBufferPercentage) / BUFFER_PERCENTAGE_PRECISION;
+
+        /// WRITE ///
+        _mint(msg.sender, shares);
+
+        uint256 availableEth = bufferEthCache + assets; // non-zero
+
+        // If the buffer is insufficient or staking is paused, doesn't stake any of the deposit
+        StakeLimitTypes.Data memory data = $.packedStakeLimitData.getStorageStakeLimitStruct();
+        if (targetBufferEth >= availableEth + queueEthCache || data.isStakingPaused()) {
+            /// WRITE ///
+            $.bufferEth = availableEth.toUint128();
+            return (assets, shares);
         }
 
-        IWETH9(Constants.WETH).withdraw(stakeAmount);
-        uint256 _stETHAmt = STETH.balanceOf(address(this));
-        STETH.submit{value: stakeAmount}(address(this)); // tx revert
-        
-        ///code
-}
+        // Calculate the amount of ETH to stake
+        uint256 stakeAmount; // can be 0
+        unchecked {
+    @>        stakeAmount = availableEth + queueEthCache - targetBufferEth; // non-zero, no underflow
+        }
+        // If the calculated stake amount exceeds the available ETH, simply assign the available ETH to the stake amount.
+        // Possible scenarios:
+        // - Target buffer percentage was changed to a lower value and there is a large withdrawal request pending.
+        // - There is a pending withdrawal request and the available ETH are not left in the buffer.
+        // - There is no pending withdrawal request and the available ETH are not left in the buffer.
+        if (stakeAmount > availableEth) {
+            // Note: Admins should be aware of this situation and take action to refill the buffer.
+            // - Pause staking to prevent further staking until the buffer is refilled
+            // - Update stake limit to a lower value
+            // - Increase the target buffer percentage
+    @>          stakeAmount = availableEth; // All available ETH
+        }
+
+        // If the amount of ETH to stake exceeds the current stake limit, cap the stake amount.
+        // This is to prevent the buffer from being completely drained. This is not a complete solution.
+        uint256 currentStakeLimit = StakeLimitUtils.calculateCurrentStakeLimit(data); // can be 0 if the stake limit is exhausted
+        if (stakeAmount > currentStakeLimit) {
+    @>          stakeAmount = currentStakeLimit;
+        }
+        /// WRITE ///
+        // Update the stake limit state in the storage
+        $.packedStakeLimitData.setStorageStakeLimitStruct(data.updatePrevStakeLimit(currentStakeLimit - stakeAmount));
+
+        /// INTERACT ///
+        // Deposit into the yield source
+        // Actual amount of ETH spent may be less than the requested amount.
+    @>      stakeAmount = _stake(stakeAmount); // stake amount can be 0
+
+        /// WRITE ///
+        $.bufferEth = (availableEth - stakeAmount).toUint128(); // no underflow theoretically
+
+        return (assets, shares);
+    }
 ```
-The `submit` function of `stETH`:
-```solidity
-function _submit(address _referral) internal returns (uint256) {
-        require(msg.value != 0, "ZERO_DEPOSIT");
-```
+The stakeAmount could be any small value. The users deposit right value using Tranche, but could revert, and they don't konw why.
+
 
 ## Impact
-The transaction should not fail but instead increase the buffer on `availableEth`.
-
+The users deposit right value using Tranche, but could revert, and they don't konw why.
 ## Code Snippet
-[src/adapters/puffer/PufETHAdapter.sol#L72](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-uups-adapters/src/adapters/puffer/PufETHAdapter.sol#L72)
-
+https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-uups-adapters/src/adapters/kelp/RsETHAdapter.sol#L77-L77
 ## Tool used
 
 Manual Review
 
 ## Recommendation
-Consider returning a zero value if `stakeLimit` equals 0:
 ```diff
-uint256 stakeLimit = STETH.getCurrentStakeLimit();
+ function _stake(uint256 stakeAmount) internal override returns (uint256) {
+        if (stakeAmount == 0) return 0;
+
+        // Check LRTDepositPool stake limit
+        uint256 stakeLimit = RSETH_DEPOSIT_POOL.getAssetCurrentLimit(Constants.ETH);
         if (stakeAmount > stakeLimit) {
             // Cap stake amount
             stakeAmount = stakeLimit;
         }
-+ if (stakeAmount == 0) return 0;        
+        // Check LRTDepositPool minAmountToDeposit
+-        if (stakeAmount <= RSETH_DEPOSIT_POOL.minAmountToDeposit()) revert MinAmountToDepositError();
++        if (stakeAmount <= RSETH_DEPOSIT_POOL.minAmountToDeposit()) return 0;
+        // Check paused of LRTDepositPool
+        if (RSETH_DEPOSIT_POOL.paused()) revert ProtocolPaused();
+
+        // Interact
+        IWETH9(Constants.WETH).withdraw(stakeAmount);
+        uint256 _rsETHAmt = RSETH.balanceOf(address(this));
+        RSETH_DEPOSIT_POOL.depositETH{value: stakeAmount}(0, REFERRAL_ID);
+        _rsETHAmt = RSETH.balanceOf(address(this)) - _rsETHAmt;
+
+        if (_rsETHAmt == 0) revert InvariantViolation();
+
+        return stakeAmount;
+    }
 ```
 
 
 
 ## Discussion
 
+**massun-onibakuchi**
+
+Such DoS doesn't meat requirements. This is because
+- The revert doesn't always happen. It can happens when depositing small amount.
+- It's unlikely that users deposit such small amount, wasting gas cost.
+- `stakeAmount` can be changed by changing maxStakeLimit on adapter and we can definitely avoid such revert if needed
+
 **sherlock-admin2**
 
-The protocol team fixed this issue in the following PRs/commits:
-https://github.com/napierfi/napier-uups-adapters/pull/14
+1 comment(s) were left on this issue during the judging contest.
+
+**z3s** commented:
+> Low/Info; For an issue to be a valid Denial of Service (DoS), it must meet one of these criteria: 1. The issue causes locking of funds for users for more than a week. 2. The issue impacts the availability of time-sensitive functions. but The stakeAmount can be modified by changing the maxStakeLimit.
 
 
-# Issue M-9: Adapters revert when 0 shares are minted, making it impossible to deposit under certain conditions 
+
+**0502lian**
+
+it's not because It can happens when depositing small amount. It's because  stakeAmount is calculated by `prefundedDeposit `. User deposit a large amount, stakeAmount can still be small amount (even zero) in _stake()
+
+**WangSecurity**
+
+After the discussions on escalation on #54, this report will be the main issue of a new family.
+
+# Issue M-8: Adapters revert when 0 shares are minted, making it impossible to deposit under certain conditions 
 
 Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/64 
 
@@ -1032,77 +1095,24 @@ If going for a different fix please note that the [EETHAdapter](https://github.c
 **sherlock-admin2**
 
 The protocol team fixed this issue in the following PRs/commits:
-https://github.com/napierfi/napier-uups-adapters/pull/12
+https://github.com/napierfi/napier-uups-adapters/pull/16
 https://github.com/napierfi/napier-v1/pull/220
 
 
-# Issue M-10: Users can frontrun LSTs/LRTs tokens prices decrease in order to avoid losses 
+**zzykxx**
 
-Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/65 
+An edge case was found in the proposed fix. `_stake()` could still revert if `RSETH_DEPOSIT_POOL.minAmountToDeposit()` returns `0`. This has been fixed in a new PR: https://github.com/napierfi/napier-uups-adapters/pull/23
 
-The protocol has acknowledged this issue.
+**sherlock-admin2**
 
-## Found by 
-zzykxx
-## Summary
+The Lead Senior Watson signed off on the fix.
 
-Users can redeem their `PT`/`YT` tokens before a price decrease of a supported LST/LRT token in order to avoid losses.
-
-## Vulnerability Detail
-
-Napier allows users to redeem their `PT`/`YT` tokens for `ETH` via [BaseLSTAdapter::prefundedRedeem()](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/adapters/BaseLSTAdapter.sol#L168) instantly if the amount to be withdrawn is lower or equal than the available `ETH` buffer. The in-scope adapters that allow this are:
-
-- [EETHAdapter](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/adapters/etherfi/EETHAdapter.sol)
-- [UniEthAdapter](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/adapters/bedrock/UniETHAdapter.sol)
-
-A Napier user that staked in one of these adapters can:
-
-1. Monitor the mempool and the beacon chain to know in advance if either the `eETH` or `uniETH` tokens will lose value.
-2. Frontrun the value loss by redeeming their `PT` and `YT`tokens via [Tranche::redeemWithYT()](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/Tranche.sol#L231), which will call [BaseLSTAdapter::prefundedRedeem()](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/adapters/BaseLSTAdapter.sol#L168), in exchange for `ETH`.
-
-Because the value drop is still not reflected in the Napier protocol the staker will be able to withdraw his funds without being affected by the losses.
-
-In the case of `eETH`, a rebase token, an attacker can know if a balance drop will happen by monitoring the mempool for calls to `rebase()` in the EtherFi [LiquidityPool](https://etherscan.io/address/0x308861A430be4cce5502d0A12724771Fc6DaF216#writeProxyContract) contract.
-
-In the case of `uniEth` an attacker can know if the token will lose value by monitoring the protocol validators for penalties and slashing events. Bedrock (`uniEth`) is built on top of Eigenlayer, which can be notified of balance drops due to penalties or slashings via two permissionless functions: [EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185) and [EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232). This allows an attacker to perform the following series of calls atomically to avoid losses:
-
-1. Monitor the Bedrock validators on the beacon chain for penalties and slashings.
-2. Call [Tranche::redeemWithYT()](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/Tranche.sol#L231) to redeem `PT`/`YT` in exchange of `ETH`.
-3. Call [EigenPod::verifyBalanceUpdates()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L185)/[EigenPod::verifyAndProcessWithdrawals()](https://github.com/Layr-Labs/eigenlayer-contracts/blob/v0.2.1-goerli-m2/src/contracts/pods/EigenPod.sol#L232) to notify Eigenlayer of the balance drop.
-4. The value of `uniETH` will instantly drop.
-5. Deposit the previously withdrawn `ETH` for more `YT`/`PT` tokens than the initial amount.
-
-Another instance that instantly lowers the value held by the `UniEthAdapter` adapter is the call to [UniETHAdapter::swapUniETHForETH()](https://github.com/sherlock-audit/2024-05-napier-update/blob/main/napier-v1/src/adapters/bedrock/UniETHAdapter.sol#L185) because a `0.05%` fee is paid to UniswapV3, this can also be front run by stakers to avoid bearing the losses of the fee.
-
-## Impact
-
-Stakers can avoid losses, which implies honest stakers will lose more than they should.
-
-## Code Snippet
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-Introduce a withdraw queue, this will prevent this kind of frontrunning attacks.
-
-
-
-
-## Discussion
-
-**massun-onibakuchi**
-
-It is known behavior seen in many LST/LRT integrations like DEX 
-
-# Issue M-11: Kelp adapter won't allow users to deposit if `getAssetCurrentLimit` returns `0` 
+# Issue M-9: Kelp adapter won't allow users to deposit if `getAssetCurrentLimit` returns `0` 
 
 Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/75 
 
 ## Found by 
-zzykxx
+merlin, zzykxx
 ## Summary
 
 Users will be unable to deposit into the Kelp adapter when 
@@ -1190,4 +1200,8 @@ function _stake(uint256 stakeAmount) internal override returns (uint256) {
 The protocol team fixed this issue in the following PRs/commits:
 https://github.com/napierfi/napier-uups-adapters/pull/13
 
+
+**sherlock-admin2**
+
+The Lead Senior Watson signed off on the fix.
 
