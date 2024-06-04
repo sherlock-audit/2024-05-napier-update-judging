@@ -834,6 +834,8 @@ The Lead Senior Watson signed off on the fix.
 
 Source: https://github.com/sherlock-audit/2024-05-napier-update-judging/issues/46 
 
+The protocol has acknowledged this issue.
+
 ## Found by 
 Drynooo, PNS, merlin, no, zzykxx
 
